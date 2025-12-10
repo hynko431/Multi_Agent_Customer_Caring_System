@@ -8,10 +8,12 @@ load_dotenv()
 # API Keys - Set these as environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Model configurations
 OPENAI_MODEL = "gpt-4"
-GEMINI_MODEL = "gemini-pro"
+GEMINI_MODEL = "gemini-2.0-flash"
+GROQ_MODEL = "openai/gpt-oss-safeguard-20b"
 
 # System settings
 REQUEST_TIMEOUT = 30  # seconds
@@ -21,27 +23,27 @@ SESSION_TIMEOUT = 3600  # 1 hour
 # Agent configurations
 AGENT_CONFIGS = {
     "orchestrator": {
-        "model": OPENAI_MODEL,
+        "model": GROQ_MODEL,
         "temperature": 0.3,
         "max_tokens": 1000
     },
     "order": {
-        "model": OPENAI_MODEL,
+        "model": GROQ_MODEL,
         "temperature": 0.1,
         "max_tokens": 500
     },
     "tech_support": {
-        "model": OPENAI_MODEL,
+        "model": GROQ_MODEL,
         "temperature": 0.2,
         "max_tokens": 800
     },
     "product": {
-        "model": OPENAI_MODEL,
+        "model": GROQ_MODEL,
         "temperature": 0.2,
         "max_tokens": 600
     },
     "solutions": {
-        "model": OPENAI_MODEL,
+        "model": GROQ_MODEL,
         "temperature": 0.3,
         "max_tokens": 700
     }

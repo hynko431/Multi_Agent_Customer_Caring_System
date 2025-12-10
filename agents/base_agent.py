@@ -4,8 +4,8 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
-import openai
-from config import OPENAI_API_KEY, AGENT_CONFIGS
+from langchain_groq import ChatGroq
+from config import GROQ_API_KEY, AGENT_CONFIGS
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +16,15 @@ class BaseAgent(ABC):
         self.agent_type = agent_type
         self.config = AGENT_CONFIGS.get(agent_type, AGENT_CONFIGS["orchestrator"])
         
-        if OPENAI_API_KEY:
-            self.client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+        if GROQ_API_KEY:
+            self.client = ChatGroq(
+                api_key=GROQ_API_KEY,
+                model_name=self.config["model"],
+                temperature=self.config["temperature"],
+                max_tokens=self.config["max_tokens"]
+            )
         else:
-            logger.warning(f"OpenAI API key not configured - {agent_type} agent will use mock responses")
+            logger.warning(f"Groq API key not configured - {agent_type} agent will use mock responses")
             self.client = None
     
     @abstractmethod
@@ -34,41 +39,69 @@ class BaseAgent(ABC):
     
     async def generate_response(self, user_message: str, context: Dict[str, Any], 
                              tools_used: List[str] = None) -> Dict[str, Any]:
-        """Generate AI response using OpenAI API."""
+        """Generate AI response using Groq API."""
         if not self.client:
             return await self._generate_mock_response(user_message, context)
         
         try:
-            # Prepare conversation history
+            # Prepare conversation history in LangChain format
             messages = [
-                {"role": "system", "content": self.get_system_prompt()},
-                {"role": "user", "content": self._format_user_message(user_message, context)}
+                ("system", self.get_system_prompt()),
             ]
             
             # Add recent conversation history if available
             if context.get("recent_conversation"):
                 for msg in context["recent_conversation"][-3:]:  # Last 3 messages
-                    messages.insert(-1, {
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
+                    messages.append((msg["role"], msg["content"]))
             
+            # Add current user message
+            messages.append(("user", self._format_user_message(user_message, context)))
+            
+            # Add format instruction
+            format_instruction = """
+            IMPORTANT: You must format your response as a JSON object with the following structure:
+            {
+                "response": "Your natural language response here",
+                "confidence": <float between 0.0 and 1.0>,
+                "evidence": ["list", "of", "sources", "used", "e.g. order_db, policy_doc, previous_chat"]
+            }
+            """
+            messages.append(("system", format_instruction))
+
             # Generate response
-            response = await self.client.chat.completions.create(
-                model=self.config["model"],
-                messages=messages,
-                temperature=self.config["temperature"],
-                max_tokens=self.config["max_tokens"]
-            )
+            response = await self.client.ainvoke(messages)
             
-            agent_response = response.choices[0].message.content
+            # Parse JSON response
+            import json
+            import re
+            
+            content = response.content
+            parsed_result = {}
+            
+            try:
+                # cleaner parsing logic
+                content = content.strip()
+                if content.startswith("```json"):
+                    content = content.split("```json")[1]
+                if content.endswith("```"):
+                    content = content.rsplit("```", 1)[0]
+                
+                parsed_result = json.loads(content)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse JSON response from {self.agent_type}, falling back to text")
+                parsed_result = {
+                    "response": response.content,
+                    "confidence": self._estimate_confidence(response.content),
+                    "evidence": []
+                }
             
             return {
-                "response": agent_response,
+                "response": parsed_result.get("response", ""),
                 "agent_type": self.agent_type,
                 "tools_used": tools_used or [],
-                "confidence": self._estimate_confidence(agent_response),
-                "thinking_process": f"Analyzed request using {self.agent_type} expertise and provided specialized response"
+                "confidence": parsed_result.get("confidence", 0.5),
+                "evidence": parsed_result.get("evidence", []),
+                "thinking_process": f"Analyzed request using {self.agent_type} expertise and provided structured response"
             }
             
         except Exception as e:
@@ -115,6 +148,7 @@ class BaseAgent(ABC):
             "agent_type": self.agent_type,
             "tools_used": [],
             "confidence": 0.6,
+            "evidence": ["mock_data"],
             "thinking_process": f"Generated mock response using {self.agent_type} agent (API not configured)"
         }
     
@@ -127,5 +161,6 @@ class BaseAgent(ABC):
             "tools_used": agent_response.get("tools_used", []),
             "tool_results": tool_results or [],
             "confidence": agent_response.get("confidence", 0.5),
+            "evidence": agent_response.get("evidence", []),
             "thinking_process": agent_response.get("thinking_process", "")
         }

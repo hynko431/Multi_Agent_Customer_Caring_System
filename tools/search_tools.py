@@ -4,7 +4,8 @@ import asyncio
 import aiohttp
 import logging
 from typing import List, Dict, Any, Optional
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL
 
 logger = logging.getLogger(__name__)
@@ -14,15 +15,16 @@ class SearchTools:
     
     def __init__(self):
         if GEMINI_API_KEY:
-            genai.configure(api_key=GEMINI_API_KEY)
-            self.model = genai.GenerativeModel(GEMINI_MODEL)
+            self.client = genai.Client(api_key=GEMINI_API_KEY)
+            self.model_id = GEMINI_MODEL
+            print(f"Gemini client initialized: {self.client}")
         else:
             logger.warning("Gemini API key not configured - search will use mock responses")
-            self.model = None
+            self.client = None
     
     async def search_web(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
         """Search the web for current information."""
-        if not self.model:
+        if not self.client:
             return self._mock_web_search(query)
         
         try:
@@ -36,8 +38,22 @@ class SearchTools:
             Format your response as a summary of key points.
             """
             
+            # Fix: Ensure tool_choice is auto if we were to use tools, 
+            # and use the new SDK generate_content method.
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode='AUTO'
+                    )
+                )
+            )
+
             response = await asyncio.to_thread(
-                self.model.generate_content, search_prompt
+                self.client.models.generate_content,
+                model=self.model_id,
+                contents=search_prompt,
+                config=config
             )
             
             return [{
@@ -53,7 +69,7 @@ class SearchTools:
     
     async def find_deals(self, product_type: str) -> List[Dict[str, Any]]:
         """Search for current deals on specific product types."""
-        if not self.model:
+        if not self.client:
             return self._mock_deals_search(product_type)
         
         try:
@@ -68,8 +84,20 @@ class SearchTools:
             Provide practical information that would help a customer make a purchasing decision.
             """
             
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode='AUTO'
+                    )
+                )
+            )
+
             response = await asyncio.to_thread(
-                self.model.generate_content, deals_prompt
+                self.client.models.generate_content,
+                model=self.model_id,
+                contents=deals_prompt,
+                config=config
             )
             
             return [{
@@ -85,7 +113,7 @@ class SearchTools:
     
     async def search_competitors(self, product: str) -> List[Dict[str, Any]]:
         """Search for competitor information and alternatives."""
-        if not self.model:
+        if not self.client:
             return self._mock_competitor_search(product)
         
         try:
@@ -100,8 +128,20 @@ class SearchTools:
             Focus on helping customers understand their options.
             """
             
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode='AUTO'
+                    )
+                )
+            )
+
             response = await asyncio.to_thread(
-                self.model.generate_content, competitor_prompt
+                self.client.models.generate_content,
+                model=self.model_id,
+                contents=competitor_prompt,
+                config=config
             )
             
             return [{

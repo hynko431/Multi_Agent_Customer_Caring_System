@@ -37,6 +37,7 @@ class ExecutionPlan:
         self.execution_mode = ExecutionMode.SEQUENTIAL
         self.estimated_time = 0
         self.confidence = 0.0
+        self.primary_intent = None # New field
         self.created_at = None
         self.status = "created"  # created, executing, completed, failed
 
@@ -46,24 +47,24 @@ class Planner:
     def __init__(self):
         self.agent_capabilities = {
             "order": {
-                "keywords": ["order", "tracking", "delivery", "shipping", "return", "refund", "warranty"],
+                "keywords": ["order", "tracking", "delivery", "shipping", "shipped", "warranty"],
                 "tools": ["order_tools", "tracking"],
                 "priority": 1
             },
             "tech_support": {
-                "keywords": ["not working", "broken", "fix", "troubleshoot", "support", "help", "issue", "problem"],
+                "keywords": ["not working", "broken", "fix", "troubleshoot", "support", "help", "issue", "problem", "error", "fail"],
                 "tools": ["knowledge_tools", "search_tools"],
                 "priority": 2
             },
             "product": {
-                "keywords": ["specs", "compare", "recommend", "alternative", "price", "features", "which", "best"],
+                "keywords": ["specs", "compare", "recommend", "alternative", "price", "features", "which", "best", "buy", "purchase", "new"],
                 "tools": ["product_tools", "search_tools"],
                 "priority": 2
             },
             "solutions": {
-                "keywords": ["disappointed", "unsatisfied", "compensation", "exchange", "solution", "resolve"],
+                "keywords": ["disappointed", "unsatisfied", "compensation", "exchange", "solution", "resolve", "refund", "money back", "complain"],
                 "tools": ["knowledge_tools", "order_tools"],
-                "priority": 3
+                "priority": 0
             }
         }
     
@@ -96,6 +97,31 @@ class Planner:
             plan.estimated_time = self._estimate_execution_time(plan.steps)
             plan.confidence = self._estimate_plan_confidence(plan.steps, context)
             plan.status = "ready"
+            
+            # Identify primary intent (first agent)
+            if required_agents:
+                plan.primary_intent = required_agents[0]
+            
+            # --- Intent Drift Detection ---
+            intent_history = context.get("intent_history", [])
+            if intent_history and plan.primary_intent:
+                previous_intent = intent_history[-1]
+                current_intent = plan.primary_intent
+                
+                # Rule 1: Support -> Solutions (Escalation)
+                if previous_intent == "tech_support" and current_intent == "solutions":
+                    logger.warning("Intent Drift: Escalation Detected (Support -> Solutions)")
+                    plan.execution_mode = ExecutionMode.CONDITIONAL  # Force careful execution
+                    # Ensure solutions is priority 1 if not already
+                    for step in plan.steps:
+                        if step.agent_type == "solutions":
+                            step.priority = 1
+                
+                # Rule 2: Support -> Product (Pivot/Cross-sell)
+                elif previous_intent == "tech_support" and current_intent == "product":
+                    logger.info("Intent Drift: Pivot Detected (Support -> Product)")
+                    # Maybe parallel is fine, but good to note
+            # ------------------------------
             
             logger.info(f"Created plan {plan_id} with {len(plan.steps)} steps, mode: {plan.execution_mode.value}")
             return plan

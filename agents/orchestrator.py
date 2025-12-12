@@ -12,6 +12,7 @@ from agents.product_agent import ProductAgent
 from agents.solutions_agent import SolutionsAgent
 from planning.planner import planner, ExecutionPlan, ExecutionMode
 from memory.session_memory import memory
+from agents.meta_reasoning import MetaReasoning
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,9 @@ class Orchestrator(BaseAgent):
             "product": ProductAgent(),
             "solutions": SolutionsAgent()
         }
+        
+        # Initialize meta-reasoner
+        self.meta_reasoner = MetaReasoning(self)
         
         logger.info("Orchestrator initialized with all specialist agents")
     
@@ -58,12 +62,13 @@ class Orchestrator(BaseAgent):
         Synthesize their responses into a single, coherent customer response.
         """
     
-    async def process_request(self, user_message: str, session_id: str) -> Dict[str, Any]:
+    async def process_request(self, user_message: str, session_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
         """Process a customer request by coordinating specialist agents."""
         try:
             start_time = datetime.now()
             
-            # Get session context
+            # Ensure session exists and get context
+            session_id, session = memory.get_or_create_session(session_id, user_id)
             context = memory.get_context_for_agents(session_id)
             
             # Create execution plan
@@ -77,8 +82,56 @@ class Orchestrator(BaseAgent):
                 return await self._handle_invalid_plan(user_message, context, validation_issues)
             
             # Execute plan
+            # Execute plan
             logger.info(f"Executing plan {plan.plan_id} with {len(plan.steps)} steps in {plan.execution_mode.value} mode")
             execution_results = await self._execute_plan(plan, user_message, context)
+            
+            # --- Meta-Reasoning Review Loop ---
+            retry_count = 0
+            max_retries = 3
+            
+            while retry_count < max_retries:
+                # Review execution results
+                logger.info(f"Performing meta-reasoning review (attempt {retry_count + 1})")
+                review = await self.meta_reasoner.review_execution(user_message, execution_results, context)
+                
+                if review.is_valid:
+                    logger.info("✅ Meta-reasoning review passed")
+                    # Record success for all involved agents
+                    for result in execution_results:
+                        if result.get("agent_used"):
+                            memory.record_agent_success(session_id, result["agent_used"], True)
+                    break
+                
+                logger.warning(f"⚠️ Review issues found: {review.issues}")
+                
+                 # Record failure (partial) for involved agents if it was their fault
+                 # For simplicity, we just trust the review passed eventually or we handled it.
+                 # If we are retrying, it means the initial agents might have missed something.
+                
+                logger.warning(f"⚠️ Contradictions: {review.contradictions}")
+                logger.warning(f"⚠️ Missing intent: {review.missing_intent}")
+                
+                if retry_count == max_retries - 1:
+                    logger.warning("Max retries reached, proceeding with best effort")
+                    break
+                    
+                # Determine remediation
+                remediation_plan = await self._create_remediation_plan(
+                    user_message, review, context
+                )
+                
+                if not remediation_plan or not remediation_plan.steps:
+                    logger.warning("Could not create remediation plan, proceeding")
+                    break
+                    
+                # Execute remediation
+                logger.info(f"Executing remediation plan with {len(remediation_plan.steps)} steps")
+                remediation_results = await self._execute_plan(remediation_plan, user_message, context)
+                execution_results.extend(remediation_results)
+                
+                retry_count += 1
+            # ----------------------------------
             
             # Synthesize final response
             final_response = await self._synthesize_response(
@@ -91,6 +144,10 @@ class Orchestrator(BaseAgent):
                 "user", 
                 user_message
             )
+            
+            # Record intent
+            if hasattr(plan, 'primary_intent') and plan.primary_intent:
+                memory.add_intent(session_id, plan.primary_intent)
             memory.add_message(
                 session_id,
                 "assistant",
@@ -228,6 +285,7 @@ class Orchestrator(BaseAgent):
                         "agent": result.get("agent_used", "unknown"),
                         "response": result.get("response", ""),
                         "confidence": result.get("confidence", 0.5),
+                        "evidence": result.get("evidence", []),
                         "tools_used": result.get("tools_used", [])
                     }
                     for result in agent_results if result.get("response")
@@ -284,24 +342,108 @@ class Orchestrator(BaseAgent):
     
     def _create_synthesis_prompt(self, synthesis_context: Dict[str, Any]) -> str:
         """Create a prompt for synthesizing multiple agent responses."""
-        prompt = f"Customer Request: {synthesis_context['user_request']}\n\n"
-        prompt += "Specialist Agent Responses:\n"
         
-        for i, response_info in enumerate(synthesis_context['agent_responses'], 1):
-            prompt += f"{i}. {response_info['agent'].title()} Agent: {response_info['response']}\n\n"
+        # Calculate weights/scores for each response to guide the synthesis
+        scored_responses = []
+        for resp in synthesis_context['agent_responses']:
+            agent_name = resp['agent']
+            conf = resp.get('confidence', 0.5)
+            
+            # Get success rate from memory (hack: accessing global memory, normally should be passed in context)
+            # We'll use a safe default if not found
+            success_rate = 0.8 # Default high trust
+            try: 
+                 # We need session_id to get real stats, but here we might not have it easily in this method signature
+                 # unless we pass it. For now, we'll use a static reliability map + confidence.
+                 pass
+            except:
+                pass
+
+            # reliability map
+            source_reliability = {
+                "order": 0.9, # DB is source of truth
+                "tech_support": 0.8,
+                "product": 0.8,
+                "solutions": 0.7
+            }
+            reliability = source_reliability.get(agent_name, 0.7)
+            
+            # Score = (Conf * 0.5) + (Reliability * 0.5)
+            score = (conf * 0.5) + (reliability * 0.5)
+            
+            scored_responses.append({**resp, "score": score})
+            
+        # Sort by score descending
+        scored_responses.sort(key=lambda x: x["score"], reverse=True)
+        
+        prompt = f"Customer Request: {synthesis_context['user_request']}\n\n"
+        prompt += "Specialist Agent Responses (Weighted by Confidence & Reliability):\n"
+        
+        for i, response_info in enumerate(scored_responses, 1):
+            evidence_str = f" (Evidence: {', '.join(response_info.get('evidence', []))})" if response_info.get('evidence') else ""
+            prompt += f"{i}. {response_info['agent'].title()} Agent (Trust Score: {response_info['score']:.2f}):\n"
+            prompt += f"   Response: {response_info['response']}\n"
+            prompt += f"   Confidence: {response_info.get('confidence', 0.5)}{evidence_str}\n\n"
         
         prompt += """
-        Please synthesize these specialist responses into a single, coherent customer service response that:
-        - Addresses all aspects of the customer's request
-        - Flows naturally as if from one knowledgeable representative
-        - Prioritizes the most important information for the customer
-        - Maintains a helpful and professional tone
-        - Includes specific details (order numbers, product names, etc.) when relevant
+        Please synthesize these specialist responses into a single, coherent customer service response.
         
-        Provide a unified response that feels natural and complete.
+        CRITICAL INSTRUCTIONS:
+        1. Trust higher scored agents more, especially for factual data (order status, specs).
+        2. If agents contradict, DEFER to the one with the higher Trust Score.
         """
+
         
         return prompt
+    
+    async def _create_remediation_plan(self, user_message: str, review: Any, context: Dict[str, Any]) -> Optional[ExecutionPlan]:
+        """Create a plan to fix issues found during review."""
+        try:
+            # If explicit action suggested, try to map it
+            if review.suggested_action and "solutions" in review.suggested_action.lower():
+                from planning.planner import planner  # Import locally to avoid circular dep if needed
+                plan = ExecutionPlan(user_message, "remediation-solutions")
+                # Fix: Access the private method via class or make it public. 
+                # For now, manually creating steps as planner helper is internal
+                # Better approach: modify planner to receive feedback, but that's out of scope
+                # We'll stick to a simple mapping for now
+                from planning.planner import PlanStep, ExecutionMode
+                
+                plan.steps = [
+                    PlanStep("solutions", "Address unresolved customer satisfaction issues", priority=1)
+                ]
+                plan.execution_mode = ExecutionMode.SEQUENTIAL
+                return plan
+                
+            # If missing intent detected, try to find a matching agent
+            if review.missing_intent:
+                # Simple keyword matching
+                missing_lower = review.missing_intent.lower()
+                agent_to_call = None
+                
+                if any(w in missing_lower for w in ["return", "refund", "exchange", "compensat"]):
+                    agent_to_call = "solutions"
+                elif any(w in missing_lower for w in ["tech", "broken", "fix", "error"]):
+                    agent_to_call = "tech_support"
+                elif any(w in missing_lower for w in ["order", "ship", "track"]):
+                    agent_to_call = "order"
+                elif any(w in missing_lower for w in ["product", "spec", "compare"]):
+                    agent_to_call = "product"
+                    
+                if agent_to_call:
+                     from planning.planner import PlanStep, ExecutionMode
+                     plan = ExecutionPlan(user_message, f"remediation-{agent_to_call}")
+                     plan.steps = [
+                        PlanStep(agent_to_call, f"Address missing intent: {review.missing_intent}", priority=1)
+                     ]
+                     plan.execution_mode = ExecutionMode.SEQUENTIAL
+                     return plan
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error creating remediation plan: {e}")
+            return None
     
     async def _create_fallback_response(self, agent_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Create a fallback response when synthesis fails."""
